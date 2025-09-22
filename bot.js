@@ -12,9 +12,17 @@ fs.ensureDirSync(videosDir);
 
 // URL pattern matching
 const urlPatterns = {
-    youtube: /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+    youtube: /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:shorts\/|watch\?v=|embed\/|v\/|e\/|user\/|c\/|channel\/|playlist\?list=)?([a-zA-Z0-9_-]{11})|youtu\.be\/([a-zA-Z0-9_-]{11}))/,
     instagram: /(?:https?:\/\/)?(?:www\.)?instagram\.com\/(?:p|tv|reel|share\/reel)\/([A-Za-z0-9_-]+)/,
-    tiktok: /(?:https?:\/\/)?(?:(?:www\.)?tiktok\.com\/@[^\/]+\/video\/\d+|vt\.tiktok\.com\/[A-Za-z0-9_-]+)/
+    tiktok: /(?:https?:\/\/)?(?:(?:www\.)?tiktok\.com\/@[^\/]+\/video\/\d+|vt\.tiktok\.com\/[A-Za-z0-9_-]+)/,
+    twitter: /(?:https?:\/\/)?(?:www\.)?(?:twitter|x)\.com\/(?:i\/web|\w+)\/status\/(\d+)/,
+    facebook: /(?:https?:\/\/)?(?:www\.)?facebook\.com\/(?:watch\/\?v=|\w+\/videos\/|reel\/|story\.php\?story_fbid=)([0-9]+)/,
+    vimeo: /(?:https?:\/\/)?(?:www\.)?vimeo\.com\/(\d+)/,
+    dailymotion: /(?:https?:\/\/)?(?:www\.)?dai(?:ly)?motion\.com\/(?:video|shorts)\/([a-zA-Z0-9]+)/,
+    pinterest: /(?:https?:\/\/)?(?:www\.)?pinterest\.com\/pin\/(\d+)/,
+    reddit: /(?:https?:\/\/)?(?:www\.)?reddit\.com\/r\/[^\/]+\/comments\/([a-zA-Z0-9]+)/,
+    likee: /(?:https?:\/\/)?(?:www\.)?likee\.video\/v\/([a-zA-Z0-9]+)/,
+    kwai: /(?:https?:\/\/)?(?:www\.)?kwai\.com\/video\/([a-zA-Z0-9]+)/
 };
 
 async function downloadVideo(url, platform) {
@@ -87,7 +95,7 @@ async function startBot() {
                 startBot();
             }
         } else if (connection === 'open') {
-            console.log('✅ WhatsApp bot connected successfully!');
+            console.log('✅ Bot başarıyla whatsappa bağlandı!');
         }
     });
 
@@ -128,7 +136,7 @@ async function startBot() {
                     const fileSizeInMB = stats.size / (1024 * 1024);
                     if (fileSizeInMB > 50) {
                         await sock.sendMessage(msg.key.remoteJid, {
-                            text: `❌ Video is too large (${fileSizeInMB.toFixed(1)}MB). WhatsApp limit is 50MB.`
+                            text: `❌ Video çok büyük (${fileSizeInMB.toFixed(1)}MB). WhatsApp sınırı 50MB.`
                         }, { quoted: msg });
                     } else {
                         const videoBuffer = await fs.readFile(videoPath);
@@ -137,19 +145,19 @@ async function startBot() {
                             caption: `✅ Video indirildi!`,
                             mimetype: 'video/mp4'
                         }, { quoted: msg });
-                        console.log(`✅ Video sent successfully from ${detectedVideo.platform}`);
+                        console.log(`✅ Şu platformdan video indirildi: ${detectedVideo.platform}`);
                     }
                     await fs.remove(videoPath);
                 } else {
                     await sock.sendMessage(msg.key.remoteJid, {
-                        text: `❌ Failed to download video from ${detectedVideo.platform}. The link might be private or unavailable.`
+                        text: `❌ Şu platformdan video indirilemedi: ${detectedVideo.platform}. The link might be private or unavailable.`
                     }, { quoted: msg });
                 }
                 return;
             } catch (error) {
                 console.error('Error processing video:', error);
                 await sock.sendMessage(msg.key.remoteJid, {
-                    text: `❌ Error downloading video: ${error.message}`
+                    text: `❌ Videoyu indirirken bir hata oluştu: ${error.message}`
                 }, { quoted: msg });
                 return;
             }
@@ -159,14 +167,14 @@ async function startBot() {
 }
 
 // Start the bot
-console.log('🚀 Starting WhatsApp Video Bot...');
+console.log('🚀 Bot Başlatılıyor...(Bitirmek için CTRL+C)');
 startBot().catch((err) => {
     console.error('DEBUG: startBot hata:', err);
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\n👋 Shutting down bot...');
+    console.log('\n👋 Bot kapanıyor...');
     fs.removeSync(videosDir);
     process.exit(0);
 });
