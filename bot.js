@@ -76,6 +76,19 @@ function detectVideoUrl(text) {
     return null;
 }
 
+// Basit dosya tabanlı karaliste
+const blacklistFile = './blacklist.json';
+let blacklist = [];
+try {
+    if (fs.existsSync(blacklistFile)) {
+        blacklist = JSON.parse(fs.readFileSync(blacklistFile));
+    }
+} catch (e) { blacklist = []; }
+
+function saveBlacklist() {
+    fs.writeFileSync(blacklistFile, JSON.stringify(blacklist, null, 2));
+}
+
 async function startBot() {
     console.log('DEBUG: startBot fonksiyonu çağrıldı.');
     const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
@@ -108,8 +121,14 @@ async function startBot() {
     const processedMessageIds = new Set();
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
+
         const msg = messages[0];
         console.log('DEBUG: Yeni mesaj geldi:', msg);
+        // Karaliste kontrolü
+        if (blacklist.includes(msg.key.remoteJid)) {
+            console.log('DEBUG: Bu sohbet karalistede, mesaj yok sayıldı:', msg.key.remoteJid);
+            return;
+        }
         if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
         // Mesaj daha önce işlendi mi kontrol et
@@ -430,6 +449,48 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { sticker: webpBuffer, mimetype: 'image/webp' }, { quoted: msg });
             } catch (err) {
                 await sock.sendMessage(msg.key.remoteJid, { text: `❌ Çıkartma oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
+            }
+            return;
+        } else if (messageText.trim().toLowerCase().startsWith('/blacklist')) {
+            // Sadece bot sahibi kullanabilsin (örnek: kendi numaranız)
+            const ownerJid = '905xxxxxxxx@s.whatsapp.net'; // Buraya kendi numaranızı girin
+            if ((msg.key.participant || msg.key.remoteJid) !== ownerJid) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot sahibi kullanabilir.' }, { quoted: msg });
+                return;
+            }
+            const parts = messageText.trim().split(/\s+/);
+            if (parts.length < 2) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Karalisteye almak için sohbet JID girin. Örnek: /blacklist 120363401359968775@g.us' }, { quoted: msg });
+                return;
+            }
+            const jid = parts[1];
+            if (!blacklist.includes(jid)) {
+                blacklist.push(jid);
+                saveBlacklist();
+                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${jid} karalisteye alındı.` }, { quoted: msg });
+            } else {
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ ${jid} zaten karalistede.` }, { quoted: msg });
+            }
+            return;
+        } else if (messageText.trim().toLowerCase().startsWith('/unblacklist')) {
+            // Sadece bot sahibi kullanabilsin
+            const ownerJid = '905xxxxxxxxx@s.whatsapp.net'; // Buraya kendi numaranızı girin
+            if ((msg.key.participant || msg.key.remoteJid) !== ownerJid) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot sahibi kullanabilir.' }, { quoted: msg });
+                return;
+            }
+            const parts = messageText.trim().split(/\s+/);
+            if (parts.length < 2) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Karalisteden çıkarmak için sohbet JID girin. Örnek: /unblacklist 120363401359968775@g.us' }, { quoted: msg });
+                return;
+            }
+            const jid = parts[1];
+            if (blacklist.includes(jid)) {
+                blacklist = blacklist.filter(j => j !== jid);
+                saveBlacklist();
+                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${jid} karalisteden çıkarıldı.` }, { quoted: msg });
+            } else {
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ ${jid} karalistede değil.` }, { quoted: msg });
             }
             return;
         } else if (messageText.trim().toLowerCase().startsWith('/kick')) {
