@@ -28,19 +28,31 @@ const urlPatterns = {
     kwai: /(?:https?:\/\/)?(?:www\.)?kwai\.com\/video\/([a-zA-Z0-9]+)/
 };
 
+// Add common adult site patterns (yt-dlp often supports downloading these)
+Object.assign(urlPatterns, {
+    pornhub: /(?:https?:\/\/)?(?:www\.)?pornhub\.com\/(?:view_video\.php\?viewkey=|video\/)([a-zA-Z0-9_\-]+)/,
+    xvideos: /(?:https?:\/\/)?(?:www\.)?xvideos\.com\/video(\d+)\/?(?:[\w\-]*)/,
+    xnxx: /(?:https?:\/\/)?(?:www\.)?xnxx\.com\/(?:video|player)\/(?:[a-zA-Z0-9_\-\/]+)/,
+    xhamster: /(?:https?:\/\/)?(?:www\.)?xhamster\.com\/(?:videos)\/(?:[a-zA-Z0-9_\-\/]+)/,
+    redtube: /(?:https?:\/\/)?(?:www\.)?redtube\.com\/(?:\w+)\/(\d+)/,
+    youporn: /(?:https?:\/\/)?(?:www\.)?youporn\.com\/(?:watch|video)\/(\d+)/
+});
+
 async function downloadVideo(url, platform) {
     try {
-        console.log(`Downloading ${platform} video from: ${url}`);
+    console.log(`İndiriliyor (${platform}): ${url}`);
         
         // Generate unique filename
         const timestamp = Date.now();
         const outputPath = path.join(videosDir, `${platform}_${timestamp}.%(ext)s`);
         
-        // Download video using yt-dlp
+        // Download video using yt-dlp; use settings.maxFileSizeMB to help limit downloads
+        const maxFilesizeSetting = `${settings.maxFileSizeMB}M`;
         await ytdlp(url, {
             output: outputPath,
             format: 'best[height<=720]/best', // Optimize for WhatsApp
-            maxFilesize: '50M', // WhatsApp file size limit
+            // pass-through max filesize to yt-dlp as a hint
+            maxFilesize: maxFilesizeSetting,
         });
         
         // Find the downloaded file
@@ -54,7 +66,7 @@ async function downloadVideo(url, platform) {
         
         return null;
     } catch (error) {
-        console.error(`Error downloading ${platform} video:`, error);
+        console.error(`İndirme hatası (${platform}):`, error);
         return null;
     }
 }
@@ -77,16 +89,98 @@ function detectVideoUrl(text) {
 }
 
 // Basit dosya tabanlı karaliste
-const blacklistFile = './blacklist.json';
+const blacklistFile = path.join(__dirname, 'blacklist.json');
 let blacklist = [];
+
+// Basit ayar dosyası (settings)
+const settingsFile = path.join(__dirname, 'settings.json');
+let settings = {
+    maxFileSizeMB: 50 // default 50 MB
+};
+
+function loadSettings() {
+    try {
+        if (fs.existsSync(settingsFile)) {
+            const data = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+            settings = Object.assign(settings, data || {});
+        }
+    } catch (e) {
+        console.error('Failed to load settings:', e);
+    }
+}
+
+function saveSettings() {
+    try {
+        fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2), 'utf8');
+    } catch (e) {
+        console.error('Failed to save settings:', e);
+    }
+}
+
+// Load settings on startup
+loadSettings();
+
+// Normalize JID helper: accepts full JIDs or phone numbers and returns WhatsApp JID string.
+function normalizeJid(jid) {
+    if (!jid || typeof jid !== 'string') return null;
+    jid = jid.trim();
+    if (jid.includes('@')) return jid;
+    // keep only digits
+    const digits = jid.replace(/\D/g, '');
+    if (digits.length >= 10) {
+        // If it's 10 digits (likely local), assume Turkey country code 90 (project previously used this)
+        let normalized = digits;
+        if (digits.length === 10 && !digits.startsWith('90')) normalized = '90' + digits;
+        return normalized + '@s.whatsapp.net';
+    }
+    return null;
+}
+
+// Owner JID can be provided via environment variable OWNER_JID or edited here.
+const OWNER_JID = process.env.OWNER_JID || '905xxxxxxxx@s.whatsapp.net';
+const ownerJidNormalized = normalizeJid(OWNER_JID);
+
 try {
     if (fs.existsSync(blacklistFile)) {
-        blacklist = JSON.parse(fs.readFileSync(blacklistFile));
+        const data = JSON.parse(fs.readFileSync(blacklistFile, 'utf8'));
+        if (Array.isArray(data)) {
+            blacklist = Array.from(new Set(data.map(normalizeJid).filter(Boolean)));
+        } else {
+            blacklist = [];
+        }
     }
-} catch (e) { blacklist = []; }
+} catch (e) { console.error('Failed to load blacklist:', e); blacklist = []; }
 
+    // Admin list support: from settings.adminJids (array) and env ADMIN_JIDS (comma-separated)
+    let adminJids = new Set();
+    function loadAdmins() {
+        adminJids = new Set();
+        // from settings
+        if (Array.isArray(settings.adminJids)) {
+            settings.adminJids.forEach(j => { const n = normalizeJid(j); if (n) adminJids.add(n); });
+        }
+        // from env
+        if (process.env.ADMIN_JIDS) {
+            process.env.ADMIN_JIDS.split(',').map(s => s.trim()).forEach(j => { const n = normalizeJid(j); if (n) adminJids.add(n); });
+        }
+        // ensure owner is always an admin
+        if (ownerJidNormalized) adminJids.add(ownerJidNormalized);
+    }
+
+    function isAdmin(senderId) {
+        const n = normalizeJid(senderId);
+        return !!n && adminJids.has(n);
+    }
+
+    // initialize admin list
+    loadAdmins();
++
 function saveBlacklist() {
-    fs.writeFileSync(blacklistFile, JSON.stringify(blacklist, null, 2));
+    try {
+        fs.writeFileSync(blacklistFile, JSON.stringify(blacklist, null, 2), 'utf8');
+    } catch (e) {
+        console.error('Failed to save blacklist:', e);
+    }
 }
 
 async function startBot() {
@@ -99,10 +193,10 @@ async function startBot() {
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        console.log('DEBUG: connection.update', update);
+    console.log('DEBUG: bağlantı güncellemesi', update);
         if (qr) {
             qrcode.generate(qr, { small: true });
-            console.log('Scan the QR code above to connect your WhatsApp');
+            console.log('QR kodunu tarayarak WhatsApp hesabınızı bağlayın');
         }
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
@@ -124,9 +218,10 @@ async function startBot() {
 
         const msg = messages[0];
         console.log('DEBUG: Yeni mesaj geldi:', msg);
-        // Karaliste kontrolü
-        if (blacklist.includes(msg.key.remoteJid)) {
-            console.log('DEBUG: Bu sohbet karalistede, mesaj yok sayıldı:', msg.key.remoteJid);
+        // Karaliste kontrolü (normalize ederek kontrol et)
+        const incomingJid = normalizeJid(msg.key.remoteJid) || msg.key.remoteJid;
+        if (blacklist.includes(incomingJid)) {
+            console.log('DEBUG: Bu sohbet karalistede, mesaj yok sayıldı:', incomingJid);
             return;
         }
         if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
@@ -144,9 +239,11 @@ async function startBot() {
             msg.message.imageMessage?.caption || 
             msg.message.videoMessage?.caption;
         if (!messageText) return;
+        const msgLower = messageText.trim().toLowerCase();
+        const cmdIs = (...aliases) => aliases.some(a => msgLower.startsWith(a));
         const detectedVideo = detectVideoUrl(messageText);
         if (detectedVideo) {
-            console.log(`Detected ${detectedVideo.platform} link in chat:`, detectedVideo.url);
+            console.log(`Tespit edilen ${detectedVideo.platform} linki:`, detectedVideo.url);
             try {
                 let downloadingMsg = '🎬 Video indiriliyor...';
                 await sock.sendMessage(msg.key.remoteJid, {
@@ -156,9 +253,9 @@ async function startBot() {
                 if (videoPath) {
                     const stats = await fs.stat(videoPath);
                     const fileSizeInMB = stats.size / (1024 * 1024);
-                    if (fileSizeInMB > 50) {
+                    if (fileSizeInMB > settings.maxFileSizeMB) {
                         await sock.sendMessage(msg.key.remoteJid, {
-                            text: `❌ Video çok büyük (${fileSizeInMB.toFixed(1)}MB). WhatsApp sınırı 50MB.`
+                            text: `❌ Video çok büyük (${fileSizeInMB.toFixed(1)}MB). İzin verilen maksimum: ${settings.maxFileSizeMB}MB.`
                         }, { quoted: msg });
                     } else {
                         const videoBuffer = await fs.readFile(videoPath);
@@ -172,18 +269,18 @@ async function startBot() {
                     await fs.remove(videoPath);
                 } else {
                     await sock.sendMessage(msg.key.remoteJid, {
-                        text: `❌ Şu platformdan video indirilemedi: ${detectedVideo.platform}. The link might be private or unavailable.`
+                        text: `❌ Şu platformdan video indirilemedi: ${detectedVideo.platform}. Bağlantı özel, erişilemez veya coğrafi/kısıtlama nedeniyle engellenmiş olabilir.`
                     }, { quoted: msg });
                 }
                 return;
             } catch (error) {
-                console.error('Error processing video:', error);
+                console.error('Videoyu işlerken hata:', error);
                 await sock.sendMessage(msg.key.remoteJid, {
                     text: `❌ Videoyu indirirken bir hata oluştu: ${error.message}`
                 }, { quoted: msg });
                 return;
             }
-        } else if (messageText.trim().toLowerCase().startsWith('/qm')) {
+    } else if (cmdIs('/qm','/çıkar')) {
             // /qm komutu: Alıntılanan metni WhatsApp mesajı gibi sticker yap (pushName ve profil foto ile)
             const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
             const quotedKey = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
@@ -349,7 +446,7 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { text: `❌ Metin çıkartması oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
             }
             return;
-        } else if (messageText.trim().toLowerCase().startsWith('/qm')) {
+    } else if (cmdIs('/qm','/çıkar')) {
             // /qm komutu: Alıntılanan metni WhatsApp mesajı gibi sticker yap
             const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
             const quotedKey = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
@@ -399,7 +496,7 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { text: `❌ Metin çıkartması oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
             }
             return;
-        } else if (messageText.trim().toLowerCase().startsWith('/qm')) {
+    } else if (cmdIs('/qm','/çıkar')) {
             // /qm komutu: Alıntılanan metni çıkartma yap
             const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
             const quotedKey = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
@@ -419,7 +516,7 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { text: `❌ Metin çıkartması oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
             }
             return;
-        } else if (messageText.trim().toLowerCase().startsWith('/q')) {
+    } else if (cmdIs('/q','/foto','/fotoçıkar')) {
             // /q komutu: Sadece bir fotoğraf alıntılandığında çalışır
             const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
             const quotedKey = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
@@ -451,11 +548,11 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { text: `❌ Çıkartma oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
             }
             return;
-        } else if (messageText.trim().toLowerCase().startsWith('/blacklist')) {
+    } else if (cmdIs('/blacklist','/karaliste')) {
             // Sadece bot sahibi kullanabilsin (örnek: kendi numaranız)
-            const ownerJid = '905xxxxxxxx@s.whatsapp.net'; // Buraya kendi numaranızı girin
-            if ((msg.key.participant || msg.key.remoteJid) !== ownerJid) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot sahibi kullanabilir.' }, { quoted: msg });
+            const senderId = msg.key.participant || msg.key.remoteJid;
+            if (!isAdmin(senderId)) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot yöneticileri kullanabilir.' }, { quoted: msg });
                 return;
             }
             const parts = messageText.trim().split(/\s+/);
@@ -463,20 +560,42 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { text: '❌ Karalisteye almak için sohbet JID girin. Örnek: /blacklist 120363401359968775@g.us' }, { quoted: msg });
                 return;
             }
-            const jid = parts[1];
-            if (!blacklist.includes(jid)) {
-                blacklist.push(jid);
+            const jidInput = parts[1];
+            const normalizedJ = normalizeJid(jidInput) || jidInput;
+            if (!blacklist.includes(normalizedJ)) {
+                blacklist.push(normalizedJ);
                 saveBlacklist();
-                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${jid} karalisteye alındı.` }, { quoted: msg });
+                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${normalizedJ} karalisteye alındı.` }, { quoted: msg });
             } else {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ ${jid} zaten karalistede.` }, { quoted: msg });
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ ${normalizedJ} zaten karalistede.` }, { quoted: msg });
             }
             return;
-        } else if (messageText.trim().toLowerCase().startsWith('/unblacklist')) {
+    } else if (cmdIs('/maksimumdosyasınırı')) {
             // Sadece bot sahibi kullanabilsin
-            const ownerJid = '905xxxxxxxxx@s.whatsapp.net'; // Buraya kendi numaranızı girin
-            if ((msg.key.participant || msg.key.remoteJid) !== ownerJid) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot sahibi kullanabilir.' }, { quoted: msg });
+            const senderId3 = msg.key.participant || msg.key.remoteJid;
+            if (!isAdmin(senderId3)) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot yöneticileri kullanabilir.' }, { quoted: msg });
+                return;
+            }
+            const parts = messageText.trim().split(/\s+/);
+            if (parts.length < 2) {
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Lütfen megabayt cinsinden bir sayı girin. Örnek: /maksimumdosyasınırı 50` }, { quoted: msg });
+                return;
+            }
+            const parsed = Number(parts[1]);
+            if (Number.isNaN(parsed) || parsed <= 0) {
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Geçerli bir pozitif sayı girin. Örnek: /maksimumdosyasınırı 50` }, { quoted: msg });
+                return;
+            }
+            settings.maxFileSizeMB = Math.floor(parsed);
+            saveSettings();
+            await sock.sendMessage(msg.key.remoteJid, { text: `✅ Maksimum dosya boyutu ${settings.maxFileSizeMB}MB olarak ayarlandı.` }, { quoted: msg });
+            return;
+    } else if (cmdIs('/unblacklist','/karalistencikar','/karalistedencikar','/karalisteçikar')) {
+            // Sadece bot sahibi kullanabilsin
+            const senderId2 = msg.key.participant || msg.key.remoteJid;
+            if (!isAdmin(senderId2)) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot yöneticileri kullanabilir.' }, { quoted: msg });
                 return;
             }
             const parts = messageText.trim().split(/\s+/);
@@ -484,16 +603,17 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { text: '❌ Karalisteden çıkarmak için sohbet JID girin. Örnek: /unblacklist 120363401359968775@g.us' }, { quoted: msg });
                 return;
             }
-            const jid = parts[1];
-            if (blacklist.includes(jid)) {
-                blacklist = blacklist.filter(j => j !== jid);
+            const jidInput = parts[1];
+            const normalizedJ2 = normalizeJid(jidInput) || jidInput;
+            if (blacklist.includes(normalizedJ2)) {
+                blacklist = blacklist.filter(j => j !== normalizedJ2);
                 saveBlacklist();
-                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${jid} karalisteden çıkarıldı.` }, { quoted: msg });
+                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${normalizedJ2} karalisteden çıkarıldı.` }, { quoted: msg });
             } else {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ ${jid} karalistede değil.` }, { quoted: msg });
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ ${normalizedJ2} karalistede değil.` }, { quoted: msg });
             }
             return;
-        } else if (messageText.trim().toLowerCase().startsWith('/kick')) {
+        } else if (cmdIs('/kick','/at')) {
             // /kick komutu: Sadece grup sohbetlerinde çalışır
         } else if (messageText.trim().toLowerCase().startsWith('/lockall')) {
             // /lockall komutu: Sadece grup sohbetlerinde çalışır
@@ -510,16 +630,17 @@ async function startBot() {
                 senderId.replace('@s.whatsapp.net', '@lid'),
                 senderId.replace('@s.whatsapp.net', '@c.us')
             ];
-            let isAdmin = false;
+            let isGroupAdmin = false;
             for (const id of senderIds) {
                 const senderParticipant = groupMetadata.participants.find(p => p.id === id);
                 if (senderParticipant && (senderParticipant.admin === true || senderParticipant.admin === 'admin' || senderParticipant.admin === 'superadmin' || senderParticipant.isAdmin === true || senderParticipant.isSuperAdmin === true)) {
-                    isAdmin = true;
+                    isGroupAdmin = true;
                     break;
                 }
             }
-            if (!isAdmin) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Sadece grup yöneticileri bu komutu kullanabilir.' }, { quoted: msg });
+            // izin: grup yöneticisi veya bot yöneticisi
+            if (!isGroupAdmin && !isAdmin(senderId)) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece grup yöneticileri veya bot yöneticileri kullanabilir.' }, { quoted: msg });
                 return;
             }
             // Grubu sadece yöneticilere aç
@@ -530,7 +651,7 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { text: `❌ Grup kilitlenemedi. Hata: ${err?.message || err}` }, { quoted: msg });
             }
             return;
-        } else if (messageText.trim().toLowerCase().startsWith('/unlock')) {
+        } else if (cmdIs('/unlock','/kilitac','/kilitaç')) {
             // /unlock komutu: Sadece grup sohbetlerinde çalışır
             if (!msg.key.remoteJid.endsWith('@g.us')) {
                 await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komut sadece grup sohbetlerinde kullanılabilir.' }, { quoted: msg });
@@ -544,16 +665,16 @@ async function startBot() {
                 senderId.replace('@s.whatsapp.net', '@lid'),
                 senderId.replace('@s.whatsapp.net', '@c.us')
             ];
-            let isAdmin = false;
+            let isGroupAdmin2 = false;
             for (const id of senderIds) {
                 const senderParticipant = groupMetadata.participants.find(p => p.id === id);
                 if (senderParticipant && (senderParticipant.admin === true || senderParticipant.admin === 'admin' || senderParticipant.admin === 'superadmin' || senderParticipant.isAdmin === true || senderParticipant.isSuperAdmin === true)) {
-                    isAdmin = true;
+                    isGroupAdmin2 = true;
                     break;
                 }
             }
-            if (!isAdmin) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Sadece grup yöneticileri bu komutu kullanabilir.' }, { quoted: msg });
+            if (!isGroupAdmin2 && !isAdmin(senderId)) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece grup yöneticileri veya bot yöneticileri kullanabilir.' }, { quoted: msg });
                             await sock.sendMessage(msg.key.remoteJid, { sticker: buffer, mimetype: 'image/webp' }, { quoted: msg });
             }
             // Grubu tekrar herkese aç
