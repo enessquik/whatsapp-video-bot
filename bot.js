@@ -187,8 +187,7 @@ async function startBot() {
     console.log('DEBUG: startBot fonksiyonu çağrıldı.');
     const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
     const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: true // QR kodu otomatik terminalde göster
+        auth: state
     });
 
     sock.ev.on('connection.update', (update) => {
