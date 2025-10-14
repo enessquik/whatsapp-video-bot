@@ -1,17 +1,82 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
+// Safe Baileys loader to avoid duplicate-declaration issues if the file is accidentally concatenated
+let makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage;
+if (!global.__baileys_loaded) {
+    const baileys = require('@whiskeysockets/baileys');
+    makeWASocket = baileys.default;
+    DisconnectReason = baileys.DisconnectReason;
+    useMultiFileAuthState = baileys.useMultiFileAuthState;
+    downloadMediaMessage = baileys.downloadMediaMessage;
+    global.__baileys_loaded = { makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage };
+} else {
+    ({ makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage } = global.__baileys_loaded);
+}
+
+// Use 'qrcode' to render QR codes to terminal (ASCII)
+const qrcode = require('qrcode');
 const ytdlp = require('yt-dlp-exec');
 const fs = require('fs-extra');
 const path = require('path');
 
 // Webp dönüştürme için sharp ekle
 const sharp = require('sharp');
+const cron = require('node-cron');
+const archiver = require('archiver');
 
 console.log('DEBUG: Bot dosyası başlatıldı.');
 
 // Create videos directory
 const videosDir = './videos';
 fs.ensureDirSync(videosDir);
+// Logs and backups dirs
+const logsDir = './logs';
+const backupsDir = './backups';
+fs.ensureDirSync(logsDir);
+fs.ensureDirSync(backupsDir);
+
+function logMessage(msg) {
+    try {
+        const now = new Date();
+        const day = now.toISOString().slice(0,10); // YYYY-MM-DD
+        const logfile = path.join(logsDir, `${day}.log`);
+        const entry = {
+            timestamp: now.toISOString(),
+            id: msg.key.id,
+            from: msg.key.remoteJid,
+            participant: msg.key.participant || null,
+            message: msg.message
+        };
+        fs.appendFileSync(logfile, JSON.stringify(entry) + '\n', 'utf8');
+    } catch (e) { console.error('Log yazılamadı:', e); }
+}
+
+async function createWeeklyBackup() {
+    const now = new Date();
+    const name = `backup-${now.toISOString().slice(0,10)}.zip`;
+    const outPath = path.join(backupsDir, name);
+    return new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(outPath);
+        const archive = archiver('zip', { zlib: { level: 9 } });
+        output.on('close', () => resolve(outPath));
+        archive.on('error', err => reject(err));
+        archive.pipe(output);
+        // add folders if they exist
+        if (fs.existsSync('auth_info')) archive.directory('auth_info/', 'auth_info');
+        if (fs.existsSync(logsDir)) archive.directory(logsDir+'/', 'logs');
+        if (fs.existsSync(videosDir)) archive.directory(videosDir+'/', 'videos');
+        archive.finalize();
+    });
+}
+
+// Schedule weekly backup: every Sunday at 03:00
+cron.schedule('0 3 * * 0', async () => {
+    try {
+        console.log('Haftalık yedekleme başlatılıyor...');
+        const p = await createWeeklyBackup();
+        console.log('Yedek oluşturuldu:', p);
+    } catch (e) {
+        console.error('Yedekleme başarısız:', e);
+    }
+});
 
 // URL pattern matching
 const urlPatterns = {
@@ -194,8 +259,16 @@ async function startBot() {
         const { connection, lastDisconnect, qr } = update;
     console.log('DEBUG: bağlantı güncellemesi', update);
         if (qr) {
-            qrcode.generate(qr, { small: true });
-            console.log('QR kodunu tarayarak WhatsApp hesabınızı bağlayın');
+            // Render ASCII QR to terminal using qrcode
+            qrcode.toString(qr, { type: 'terminal', small: true })
+                .then(qrStr => {
+                    console.log(qrStr);
+                    console.log('QR kodunu tarayarak WhatsApp hesabınızı bağlayın');
+                })
+                .catch(() => {
+                    // fallback: print raw QR data
+                    console.log('QR:', qr);
+                });
         }
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
@@ -217,6 +290,8 @@ async function startBot() {
 
         const msg = messages[0];
         console.log('DEBUG: Yeni mesaj geldi:', msg);
+        // Her gelen mesajı logla (günlük dosyalara)
+        try { logMessage(msg); } catch (e) { console.error('Log mesajı hata:', e); }
         // Karaliste kontrolü (normalize ederek kontrol et)
         const incomingJid = normalizeJid(msg.key.remoteJid) || msg.key.remoteJid;
         if (blacklist.includes(incomingJid)) {
@@ -240,6 +315,23 @@ async function startBot() {
         if (!messageText) return;
         const msgLower = messageText.trim().toLowerCase();
         const cmdIs = (...aliases) => aliases.some(a => msgLower.startsWith(a));
+        // Admin komutu: /yedekle veya /backup ile anında yedek oluşturma
+        if (cmdIs('/yedekle', '/backup')) {
+            const sender = msg.key.participant || msg.key.remoteJid;
+            if (!isAdmin(sender)) {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu kullanmak için yetkiniz yok.' }, { quoted: msg });
+                return;
+            }
+            await sock.sendMessage(msg.key.remoteJid, { text: '🔄 Yedekleme başlatılıyor...' }, { quoted: msg });
+            try {
+                const p = await createWeeklyBackup();
+                await sock.sendMessage(msg.key.remoteJid, { text: `✅ Yedek tamamlandı: ${p}` }, { quoted: msg });
+            } catch (e) {
+                console.error('Manuel yedekleme hata:', e);
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Yedekleme başarısız: ${e.message}` }, { quoted: msg });
+            }
+            return;
+        }
         const detectedVideo = detectVideoUrl(messageText);
         if (detectedVideo) {
             console.log(`Tespit edilen ${detectedVideo.platform} linki:`, detectedVideo.url);
