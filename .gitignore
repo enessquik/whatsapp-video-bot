@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# WhatsApp authentication session data
+.wwebjs_auth/
+.wwebjs_cache/
+auth_info/
+
+# Bot data
+videos/
+logs/
+backups/
+
+# Configuration files with sensitive data
+blacklist.json
+settings.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.log

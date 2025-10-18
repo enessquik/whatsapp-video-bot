@@ -1,26 +1,13 @@
-// Safe Baileys loader to avoid duplicate-declaration issues if the file is accidentally concatenated
-let makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage;
-if (!global.__baileys_loaded) {
-    const baileys = require('@whiskeysockets/baileys');
-    makeWASocket = baileys.default;
-    DisconnectReason = baileys.DisconnectReason;
-    useMultiFileAuthState = baileys.useMultiFileAuthState;
-    downloadMediaMessage = baileys.downloadMediaMessage;
-    global.__baileys_loaded = { makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage };
-} else {
-    ({ makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage } = global.__baileys_loaded);
-}
-
-// Use 'qrcode' to render QR codes to terminal (ASCII)
-const qrcode = require('qrcode');
+// WhatsApp Web.js imports
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
 const ytdlp = require('yt-dlp-exec');
 const fs = require('fs-extra');
 const path = require('path');
-
-// Webp dönüştürme için sharp ekle
 const sharp = require('sharp');
 const cron = require('node-cron');
 const archiver = require('archiver');
+const axios = require('axios');
 
 console.log('DEBUG: Bot dosyası başlatıldı.');
 
@@ -40,10 +27,11 @@ function logMessage(msg) {
         const logfile = path.join(logsDir, `${day}.log`);
         const entry = {
             timestamp: now.toISOString(),
-            id: msg.key.id,
-            from: msg.key.remoteJid,
-            participant: msg.key.participant || null,
-            message: msg.message
+            id: msg.id._serialized || msg.id,
+            from: msg.from,
+            author: msg.author || null,
+            body: msg.body,
+            type: msg.type
         };
         fs.appendFileSync(logfile, JSON.stringify(entry) + '\n', 'utf8');
     } catch (e) { console.error('Log yazılamadı:', e); }
@@ -60,7 +48,7 @@ async function createWeeklyBackup() {
         archive.on('error', err => reject(err));
         archive.pipe(output);
         // add folders if they exist
-        if (fs.existsSync('auth_info')) archive.directory('auth_info/', 'auth_info');
+        if (fs.existsSync('.wwebjs_auth')) archive.directory('.wwebjs_auth/', 'wwebjs_auth');
         if (fs.existsSync(logsDir)) archive.directory(logsDir+'/', 'logs');
         if (fs.existsSync(videosDir)) archive.directory(videosDir+'/', 'videos');
         archive.finalize();
@@ -185,7 +173,7 @@ function saveSettings() {
 // Load settings on startup
 loadSettings();
 
-// Normalize JID helper: accepts full JIDs or phone numbers and returns WhatsApp JID string.
+// Normalize JID helper: accepts full JIDs or phone numbers and returns WhatsApp chat ID string.
 function normalizeJid(jid) {
     if (!jid || typeof jid !== 'string') return null;
     jid = jid.trim();
@@ -196,13 +184,13 @@ function normalizeJid(jid) {
         // If it's 10 digits (likely local), assume Turkey country code 90 (project previously used this)
         let normalized = digits;
         if (digits.length === 10 && !digits.startsWith('90')) normalized = '90' + digits;
-        return normalized + '@s.whatsapp.net';
+        return normalized + '@c.us';
     }
     return null;
 }
 
 // Owner JID can be provided via environment variable OWNER_JID or edited here.
-const OWNER_JID = process.env.OWNER_JID || '905xxxxxxxx@s.whatsapp.net';
+const OWNER_JID = process.env.OWNER_JID || '905xxxxxxxx@c.us';
 const ownerJidNormalized = normalizeJid(OWNER_JID);
 
 try {
@@ -239,7 +227,7 @@ try {
 
     // initialize admin list
     loadAdmins();
-+
+
 function saveBlacklist() {
     try {
         fs.writeFileSync(blacklistFile, JSON.stringify(blacklist, null, 2), 'utf8');
@@ -250,222 +238,173 @@ function saveBlacklist() {
 
 async function startBot() {
     console.log('DEBUG: startBot fonksiyonu çağrıldı.');
-    const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-    const sock = makeWASocket({
-        auth: state
+    
+    const puppeteerOptions = {
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu'
+        ],
+        headless: true
+    };
+    
+    // Use custom Chrome path if provided via environment variable
+    if (process.env.CHROME_BIN) {
+        puppeteerOptions.executablePath = process.env.CHROME_BIN;
+    }
+    
+    const client = new Client({
+        authStrategy: new LocalAuth(),
+        puppeteer: puppeteerOptions
     });
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-    console.log('DEBUG: bağlantı güncellemesi', update);
-        if (qr) {
-            // Render ASCII QR to terminal using qrcode
-            qrcode.toString(qr, { type: 'terminal', small: true })
-                .then(qrStr => {
-                    console.log(qrStr);
-                    console.log('QR kodunu tarayarak WhatsApp hesabınızı bağlayın');
-                })
-                .catch(() => {
-                    // fallback: print raw QR data
-                    console.log('QR:', qr);
-                });
-        }
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
-            console.log('Connection closed due to', lastDisconnect?.error, ', reconnecting:', shouldReconnect);
-            if (shouldReconnect) {
-                startBot();
-            }
-        } else if (connection === 'open') {
-            console.log('✅ Bot başarıyla whatsappa bağlandı!');
-        }
+    client.on('qr', (qr) => {
+        console.log('DEBUG: QR kod oluşturuldu');
+        qrcode.generate(qr, { small: true });
+        console.log('QR kodunu tarayarak WhatsApp hesabınızı bağlayın');
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    client.on('authenticated', () => {
+        console.log('DEBUG: Kimlik doğrulandı');
+    });
+
+    client.on('auth_failure', (msg) => {
+        console.error('Kimlik doğrulama hatası:', msg);
+    });
+
+    client.on('ready', () => {
+        console.log('✅ Bot başarıyla whatsappa bağlandı!');
+    });
+
+    client.on('disconnected', (reason) => {
+        console.log('Bağlantı kesildi:', reason);
+    });
 
     // Her mesajı sadece bir kez işlemek için işlenen mesaj ID'lerini tutan bir Set
     const processedMessageIds = new Set();
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-
-        const msg = messages[0];
-        console.log('DEBUG: Yeni mesaj geldi:', msg);
+    client.on('message', async (msg) => {
+        console.log('DEBUG: Yeni mesaj geldi:', msg.from);
+        
         // Her gelen mesajı logla (günlük dosyalara)
         try { logMessage(msg); } catch (e) { console.error('Log mesajı hata:', e); }
+        
         // Karaliste kontrolü (normalize ederek kontrol et)
-        const incomingJid = normalizeJid(msg.key.remoteJid) || msg.key.remoteJid;
+        const incomingJid = normalizeJid(msg.from) || msg.from;
         if (blacklist.includes(incomingJid)) {
             console.log('DEBUG: Bu sohbet karalistede, mesaj yok sayıldı:', incomingJid);
             return;
         }
-        if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
+        
+        // Status broadcast'leri ignore et
+        if (msg.from === 'status@broadcast') return;
 
         // Mesaj daha önce işlendi mi kontrol et
-        const messageId = msg.key.id;
+        const messageId = msg.id._serialized || msg.id;
         if (processedMessageIds.has(messageId)) {
             console.log('DEBUG: Bu mesaj zaten işlendi, atlanıyor:', messageId);
             return;
         }
         processedMessageIds.add(messageId);
 
-        const messageText = msg.message.conversation || 
-            msg.message.extendedTextMessage?.text || 
-            msg.message.imageMessage?.caption || 
-            msg.message.videoMessage?.caption;
+        const messageText = msg.body || '';
         if (!messageText) return;
         const msgLower = messageText.trim().toLowerCase();
         const cmdIs = (...aliases) => aliases.some(a => msgLower.startsWith(a));
+        
         // Admin komutu: /yedekle veya /backup ile anında yedek oluşturma
         if (cmdIs('/yedekle', '/backup')) {
-            const sender = msg.key.participant || msg.key.remoteJid;
+            const sender = msg.author || msg.from;
             if (!isAdmin(sender)) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu kullanmak için yetkiniz yok.' }, { quoted: msg });
+                await msg.reply('❌ Bu komutu kullanmak için yetkiniz yok.');
                 return;
             }
-            await sock.sendMessage(msg.key.remoteJid, { text: '🔄 Yedekleme başlatılıyor...' }, { quoted: msg });
+            await msg.reply('🔄 Yedekleme başlatılıyor...');
             try {
                 const p = await createWeeklyBackup();
-                await sock.sendMessage(msg.key.remoteJid, { text: `✅ Yedek tamamlandı: ${p}` }, { quoted: msg });
+                await msg.reply(`✅ Yedek tamamlandı: ${p}`);
             } catch (e) {
                 console.error('Manuel yedekleme hata:', e);
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Yedekleme başarısız: ${e.message}` }, { quoted: msg });
+                await msg.reply(`❌ Yedekleme başarısız: ${e.message}`);
             }
             return;
         }
+        
         const detectedVideo = detectVideoUrl(messageText);
         if (detectedVideo) {
             console.log(`Tespit edilen ${detectedVideo.platform} linki:`, detectedVideo.url);
             try {
-                let downloadingMsg = '🎬 Video indiriliyor...';
-                await sock.sendMessage(msg.key.remoteJid, {
-                    text: downloadingMsg
-                }, { quoted: msg });
+                await msg.reply('🎬 Video indiriliyor...');
                 const videoPath = await downloadVideo(detectedVideo.url, detectedVideo.platform);
                 if (videoPath) {
                     const stats = await fs.stat(videoPath);
                     const fileSizeInMB = stats.size / (1024 * 1024);
                     if (fileSizeInMB > settings.maxFileSizeMB) {
-                        await sock.sendMessage(msg.key.remoteJid, {
-                            text: `❌ Video çok büyük (${fileSizeInMB.toFixed(1)}MB). İzin verilen maksimum: ${settings.maxFileSizeMB}MB.`
-                        }, { quoted: msg });
+                        await msg.reply(`❌ Video çok büyük (${fileSizeInMB.toFixed(1)}MB). İzin verilen maksimum: ${settings.maxFileSizeMB}MB.`);
                     } else {
-                        const videoBuffer = await fs.readFile(videoPath);
-                        await sock.sendMessage(msg.key.remoteJid, {
-                            video: videoBuffer,
-                            caption: `✅ Video indirildi!`,
-                            mimetype: 'video/mp4'
-                        }, { quoted: msg });
+                        const media = MessageMedia.fromFilePath(videoPath);
+                        await client.sendMessage(msg.from, media, { caption: '✅ Video indirildi!' });
                         console.log(`✅ Şu platformdan video indirildi: ${detectedVideo.platform}`);
                     }
                     await fs.remove(videoPath);
                 } else {
-                    await sock.sendMessage(msg.key.remoteJid, {
-                        text: `❌ Şu platformdan video indirilemedi: ${detectedVideo.platform}. Bağlantı özel, erişilemez veya coğrafi/kısıtlama nedeniyle engellenmiş olabilir.`
-                    }, { quoted: msg });
+                    await msg.reply(`❌ Şu platformdan video indirilemedi: ${detectedVideo.platform}. Bağlantı özel, erişilemez veya coğrafi/kısıtlama nedeniyle engellenmiş olabilir.`);
                 }
                 return;
             } catch (error) {
                 console.error('Videoyu işlerken hata:', error);
-                await sock.sendMessage(msg.key.remoteJid, {
-                    text: `❌ Videoyu indirirken bir hata oluştu: ${error.message}`
-                }, { quoted: msg });
+                await msg.reply(`❌ Videoyu indirirken bir hata oluştu: ${error.message}`);
                 return;
             }
-    } else if (cmdIs('/qm','/çıkar')) {
-            // /qm komutu: Alıntılanan metni WhatsApp mesajı gibi sticker yap (pushName ve profil foto ile)
-            const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
-            const quotedKey = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
-            const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
-            const quotedText = quoted?.conversation || quoted?.extendedTextMessage?.text;
-            // pushName ve profil foto
+        } else if (cmdIs('/qm','/çıkar')) {
+            // /qm komutu: Alıntılanan metni WhatsApp mesajı gibi sticker yap
+            if (!msg.hasQuotedMsg) {
+                await msg.reply('❌ Lütfen bir metin mesajını alıntılayıp /qm yazın.');
+                return;
+            }
+            
+            const quotedMsg = await msg.getQuotedMessage();
+            const quotedText = quotedMsg.body;
+            
+            if (!quotedText) {
+                await msg.reply('❌ Alıntılanan mesajda metin bulunamadı.');
+                return;
+            }
+            
+            // pushName ve profil foto bilgisi
             let pushName = 'Kullanıcı';
             let profileImgData = '';
+            
             try {
-                if (quotedParticipant) {
-                    let contact = undefined;
-                    let profileUrl = '';
-                    let triedSources = [];
-                    // store desteği varsa kullan
-                    if (global.store && global.store.contacts) {
-                        contact = global.store.contacts[quotedParticipant];
-                        if (contact && contact.name) { pushName = contact.name; triedSources.push('store.name'); }
-                        else if (contact && contact.notify) { pushName = contact.notify; triedSources.push('store.notify'); }
-                        else if (contact && contact.vname) { pushName = contact.vname; triedSources.push('store.vname'); }
-                        if (global.store.fetchProfilePictureUrl) {
-                            try {
-                                profileUrl = await global.store.fetchProfilePictureUrl(quotedParticipant, 'image');
-                                if (profileUrl) triedSources.push('store.profilePictureUrl');
-                            } catch (e) { console.error('Profil foto fetch error:', e); }
-                        }
-                    }
-                    // store yoksa sock ile devam et
-                    if (!profileUrl && sock.profilePictureUrl) {
-                        try {
-                            profileUrl = await sock.profilePictureUrl(quotedParticipant, 'image');
-                            if (profileUrl) triedSources.push('sock.profilePictureUrl');
-                        } catch (e) { console.error('Profil foto sock error:', e); }
-                    }
-                    // Zorla: sock.profilePictureUrl ile tekrar dene (en son çare, hem 'image' hem 'preview')
-                    if (!profileUrl && sock.profilePictureUrl) {
-                        try {
-                            profileUrl = await sock.profilePictureUrl(quotedParticipant, 'preview');
-                            if (profileUrl) triedSources.push('sock.profilePictureUrl-preview');
-                        } catch (e) { console.error('Profil foto sock preview error:', e); }
-                    }
-                    // Son çare: WhatsApp'ın default avatarı (bağlantı)
-                    if (!profileUrl) {
-                        profileUrl = 'https://static.whatsapp.net/rsrc.php/v3/yz/r/36B424nhi3L.png';
-                        triedSources.push('default-wa-avatar');
-                    }
-                    // pushName fallback: sock.contacts
-                    if ((!pushName || pushName === 'Kullanıcı') && sock.contacts?.[quotedParticipant]) {
-                        let c = sock.contacts[quotedParticipant];
-                        if (c.pushName) { pushName = c.pushName; triedSources.push('sock.contacts.pushName'); }
-                        else if (c.notify) { pushName = c.notify; triedSources.push('sock.contacts.notify'); }
-                        else if (c.name) { pushName = c.name; triedSources.push('sock.contacts.name'); }
-                        else if (c.vname) { pushName = c.vname; triedSources.push('sock.contacts.vname'); }
-                    }
-                    // pushName fallback: sock.getName
-                    if ((!pushName || pushName === 'Kullanıcı') && sock.getName) {
-                        try {
-                            const name = await sock.getName(quotedParticipant);
-                            if (name) { pushName = name; triedSources.push('sock.getName'); }
-                        } catch (e) { console.error('getName error:', e); }
-                    }
-                    // pushName fallback: JID
-                    if (!pushName || pushName === 'Kullanıcı') {
-                        pushName = quotedParticipant.split('@')[0];
-                        triedSources.push('jid');
-                    }
-                    // Eğer pushName sadece rakam/id ise, 'Kullanıcı' olarak gösterme, gerçek isim varsa kullan
-                    if (/^\d{8,}$/.test(pushName) && (!contact || (!contact.name && !contact.notify && !contact.vname))) {
-                        pushName = 'Kullanıcı';
-                        triedSources.push('fallback:onlyId');
-                    }
-                    // profil foto base64
-                    if (profileUrl) {
-                        try {
-                            const axios = require('axios');
+                const contact = await quotedMsg.getContact();
+                if (contact) {
+                    pushName = contact.pushname || contact.name || contact.number || 'Kullanıcı';
+                    
+                    // Profil fotoğrafını al
+                    try {
+                        const profileUrl = await contact.getProfilePicUrl();
+                        if (profileUrl) {
                             const resp = await axios.get(profileUrl, { responseType: 'arraybuffer' });
                             const imgBase64 = Buffer.from(resp.data, 'binary').toString('base64');
                             profileImgData = `data:image/jpeg;base64,${imgBase64}`;
-                        } catch (e) { console.error('Profil foto indirilemedi:', e); }
-                    }
-                    console.log('DEBUG: /qm pushName:', pushName, '| tried:', triedSources, '| profileUrl:', profileUrl);
-                    if (!profileImgData) {
-                        // fallback: SVG default user icon
-                        profileImgData = '';
+                        }
+                    } catch (e) {
+                        console.error('Profil foto alınamadı:', e);
                     }
                 }
-            } catch (err) { console.error('pushName/profile hata:', err); }
+            } catch (err) {
+                console.error('pushName/profile hata:', err);
+            }
+            
             const now = new Date();
             const hour = now.getHours().toString().padStart(2, '0');
             const min = now.getMinutes().toString().padStart(2, '0');
             const timeStr = `${hour}:${min}`;
-            if (!quoted || !quotedText) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Lütfen bir metin mesajını alıntılayıp /qm yazın.' }, { quoted: msg });
-                return;
-            }
+            
             // SVG ile WhatsApp mesajı gibi sticker oluştur
             try {
                 const safeText = quotedText.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -488,167 +427,101 @@ async function startBot() {
                 let profileImgSvg = '';
                 if (profileImgData) {
                     profileImgSvg = `<clipPath id='clipCircle'><circle cx='70' cy='90' r='28'/></clipPath><image x='42' y='62' width='56' height='56' xlink:href='${profileImgData}' clip-path='url(#clipCircle)'/>`;
-                }
-                // Sadece profil fotoğrafı hiç alınamazsa kullanıcı ikonu göster
-                if (!profileImgData) {
+                } else {
+                    // Default avatar
                     profileImgSvg = `<clipPath id='clipCircle'><circle cx='70' cy='90' r='28'/></clipPath><image x='42' y='62' width='56' height='56' xlink:href='https://static.whatsapp.net/rsrc.php/v3/yz/r/36B424nhi3L.png' clip-path='url(#clipCircle)'/>`;
-                    console.error('Profil fotoğrafı bulunamadı, WhatsApp default avatar gösteriliyor. profileUrl:', profileUrl);
                 }
-                                                                // msg.pushName varsa onu kullan, yoksa resolved pushName
-                                                                                                const stickerName = msg.pushName || pushName;
-                                                                                                console.log('DEBUG: SVG stickerName kullanılacak:', stickerName);
-                                                                                                                // İsim kutusu için kelime bazlı satır kaydırma, sınırsız satır
-                                                                                                                function wrapText(text, maxLen) {
-                                                                                                                    const words = text.split(' ');
-                                                                                                                    let lines = [];
-                                                                                                                    let line = '';
-                                                                                                                    for (const word of words) {
-                                                                                                                        if ((line + (line ? ' ' : '') + word).length > maxLen) {
-                                                                                                                            if (line) lines.push(line);
-                                                                                                                            line = word;
-                                                                                                                        } else {
-                                                                                                                            line += (line ? ' ' : '') + word;
-                                                                                                                        }
-                                                                                                                    }
-                                                                                                                    if (line) lines.push(line);
-                                                                                                                    return lines;
-                                                                                                                }
-                                                                                                                const nameWrapLen = 18;
-                                                                                                                const nameLines = wrapText(stickerName, nameWrapLen);
-                                                                                                                const nameBoxWidth = Math.max(120, Math.min(340, 32 + Math.max(...nameLines.map(l => l.length)) * 18));
-                                                                                                                const nameBoxHeight = 20 + nameLines.length * 28;
-                                                                                                                const nameBoxX = 256 - nameBoxWidth / 2;
-                                                                                                                const nameBoxY = 22;
-                                                                                                                const svg = `
-                                                                                <svg width='512' height='512' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'>
-                                                                                    <rect width='100%' height='100%' fill='#ece5dd'/>
-                                                                                    <rect x='${nameBoxX}' y='${nameBoxY}' rx='14' ry='14' width='${nameBoxWidth}' height='${nameBoxHeight}' fill='#d1f0e2'/>
-                                                                                    ${nameLines.map((line, i) => `<text x='256' y='${nameBoxY + 20 + (i+1)*24}' font-size='22' font-family='Arial' fill='#075e54' font-weight='bold' text-anchor='middle'>${line}</text>`).join('')}
-                                                                                    <g>
-                                                                                        ${profileImgSvg}
-                                                                                        <rect x='40' y='60' rx='28' ry='28' width='432' height='${bubbleHeight}' fill='#dcf8c6' />
-                                                                                        ${wrapped.map((t,i)=>`<text x='60' y='${130+i*38}' font-size='30' font-family='Arial' fill='#222'>${t}</text>`).join('')}
-                                                                                        <text x='420' y='${bubbleHeight+50}' font-size='22' font-family='Arial' fill='#888'>${timeStr}</text>
-                                                                                    </g>
-                                                                                </svg>`;
-                const webpBuffer = await sharp(Buffer.from(svg)).webp({ quality: 95 }).toBuffer();
-                await sock.sendMessage(msg.key.remoteJid, { sticker: webpBuffer, mimetype: 'image/webp' }, { quoted: msg });
-            } catch (err) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Metin çıkartması oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
-            }
-            return;
-    } else if (cmdIs('/qm','/çıkar')) {
-            // /qm komutu: Alıntılanan metni WhatsApp mesajı gibi sticker yap
-            const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
-            const quotedKey = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
-            const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
-            const quotedText = quoted?.conversation || quoted?.extendedTextMessage?.text;
-            const senderName = msg.message.extendedTextMessage?.contextInfo?.participant || 'Kullanıcı';
-            const displayName = (msg.message.extendedTextMessage?.contextInfo?.participant || '').split('@')[0] || 'Kullanıcı';
-            const now = new Date();
-            const hour = now.getHours().toString().padStart(2, '0');
-            const min = now.getMinutes().toString().padStart(2, '0');
-            const timeStr = `${hour}:${min}`;
-            if (!quoted || !quotedText) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Lütfen bir metin mesajını alıntılayıp /qm yazın.' }, { quoted: msg });
-                return;
-            }
-            // SVG ile WhatsApp mesajı gibi sticker oluştur
-            try {
-                const safeText = quotedText.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-                // Satırları böl
-                const lines = safeText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-                // Satır başına max 32 karakterde böl
-                let wrapped = [];
-                for (const line of lines) {
-                    let l = line;
-                    while (l.length > 32) {
-                        wrapped.push(l.slice(0,32));
-                        l = l.slice(32);
+                
+                // İsim kutusu için kelime bazlı satır kaydırma
+                function wrapText(text, maxLen) {
+                    const words = text.split(' ');
+                    let lines = [];
+                    let line = '';
+                    for (const word of words) {
+                        if ((line + (line ? ' ' : '') + word).length > maxLen) {
+                            if (line) lines.push(line);
+                            line = word;
+                        } else {
+                            line += (line ? ' ' : '') + word;
+                        }
                     }
-                    if (l) wrapped.push(l);
+                    if (line) lines.push(line);
+                    return lines;
                 }
-                if (wrapped.length === 0) wrapped = [' '];
-                // Yükseklik hesapla
-                const bubbleHeight = 40 + wrapped.length * 38;
+                const nameWrapLen = 18;
+                const nameLines = wrapText(pushName, nameWrapLen);
+                const nameBoxWidth = Math.max(120, Math.min(340, 32 + Math.max(...nameLines.map(l => l.length)) * 18));
+                const nameBoxHeight = 20 + nameLines.length * 28;
+                const nameBoxX = 256 - nameBoxWidth / 2;
+                const nameBoxY = 22;
                 const svg = `
-<svg width='512' height='512' xmlns='http://www.w3.org/2000/svg'>
-  <rect width='100%' height='100%' fill='#ece5dd'/>
-  <g>
-    <rect x='40' y='60' rx='28' ry='28' width='432' height='${bubbleHeight}' fill='#dcf8c6' />
-    <text x='60' y='95' font-size='28' font-family='Arial' fill='#075e54' font-weight='bold'>${displayName}</text>
-    ${wrapped.map((t,i)=>`<text x='60' y='${130+i*38}' font-size='30' font-family='Arial' fill='#222'>${t}</text>`).join('')}
-    <text x='420' y='${bubbleHeight+50}' font-size='22' font-family='Arial' fill='#888'>${timeStr}</text>
-  </g>
+<svg width='512' height='512' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'>
+    <rect width='100%' height='100%' fill='#ece5dd'/>
+    <rect x='${nameBoxX}' y='${nameBoxY}' rx='14' ry='14' width='${nameBoxWidth}' height='${nameBoxHeight}' fill='#d1f0e2'/>
+    ${nameLines.map((line, i) => `<text x='256' y='${nameBoxY + 20 + (i+1)*24}' font-size='22' font-family='Arial' fill='#075e54' font-weight='bold' text-anchor='middle'>${line}</text>`).join('')}
+    <g>
+        ${profileImgSvg}
+        <rect x='40' y='60' rx='28' ry='28' width='432' height='${bubbleHeight}' fill='#dcf8c6' />
+        ${wrapped.map((t,i)=>`<text x='60' y='${130+i*38}' font-size='30' font-family='Arial' fill='#222'>${t}</text>`).join('')}
+        <text x='420' y='${bubbleHeight+50}' font-size='22' font-family='Arial' fill='#888'>${timeStr}</text>
+    </g>
 </svg>`;
                 const webpBuffer = await sharp(Buffer.from(svg)).webp({ quality: 95 }).toBuffer();
-                await sock.sendMessage(msg.key.remoteJid, { sticker: webpBuffer, mimetype: 'image/webp' }, { quoted: msg });
+                const media = new MessageMedia('image/webp', webpBuffer.toString('base64'));
+                await client.sendMessage(msg.from, media, { sendMediaAsSticker: true });
             } catch (err) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Metin çıkartması oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
+                await msg.reply(`❌ Metin çıkartması oluşturulamadı. Hata: ${err?.message || err}`);
             }
             return;
-    } else if (cmdIs('/qm','/çıkar')) {
-            // /qm komutu: Alıntılanan metni çıkartma yap
-            const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
-            const quotedKey = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
-            const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
-            const quotedText = quoted?.conversation || quoted?.extendedTextMessage?.text;
-            if (!quoted || !quotedText) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Lütfen bir metin mesajını alıntılayıp /qm yazın.' }, { quoted: msg });
-                return;
-            }
-            // Metni görsele dönüştür ve sticker olarak gönder
-            try {
-                // Basit bir arka plan ve yazı ile sticker oluştur
-                const svg = `<svg width='512' height='512' xmlns='http://www.w3.org/2000/svg'><rect width='100%' height='100%' fill='#fff'/><text x='50%' y='50%' font-size='36' font-family='Arial' fill='#222' text-anchor='middle' dominant-baseline='middle'>${quotedText.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</text></svg>`;
-                const webpBuffer = await sharp(Buffer.from(svg)).webp({ quality: 90 }).toBuffer();
-                await sock.sendMessage(msg.key.remoteJid, { sticker: webpBuffer, mimetype: 'image/webp' }, { quoted: msg });
-            } catch (err) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Metin çıkartması oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
-            }
-            return;
-    } else if (cmdIs('/q','/foto','/fotoçıkar')) {
+        } else if (cmdIs('/q','/foto','/fotoçıkar')) {
             // /q komutu: Sadece bir fotoğraf alıntılandığında çalışır
-            const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
-            const quotedKey = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
-            const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
-            if (!quoted || !quoted.imageMessage) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Lütfen bir fotoğrafı alıntılayıp /q yazın.' }, { quoted: msg });
+            if (!msg.hasQuotedMsg) {
+                await msg.reply('❌ Lütfen bir fotoğrafı alıntılayıp /q yazın.');
                 return;
             }
+            
+            const quotedMsg = await msg.getQuotedMessage();
+            
+            if (!quotedMsg.hasMedia || quotedMsg.type !== 'image') {
+                await msg.reply('❌ Lütfen bir fotoğrafı alıntılayıp /q yazın.');
+                return;
+            }
+            
             // Fotoğrafı indir ve webp'ye dönüştür
             try {
-                const buffer = await downloadMediaMessage({
-                    key: { id: quotedKey, remoteJid: msg.key.remoteJid, fromMe: false, participant: quotedParticipant },
-                    message: quoted
-                }, 'buffer');
-                if (!buffer) {
-                    await sock.sendMessage(msg.key.remoteJid, { text: '❌ Fotoğraf indirilemedi.' }, { quoted: msg });
+                const media = await quotedMsg.downloadMedia();
+                if (!media) {
+                    await msg.reply('❌ Fotoğraf indirilemedi.');
                     return;
                 }
+                
+                const buffer = Buffer.from(media.data, 'base64');
+                
                 // Webp'ye dönüştür
                 let webpBuffer;
                 try {
                     webpBuffer = await sharp(buffer).resize(512, 512, { fit: 'inside' }).webp({ quality: 80 }).toBuffer();
                 } catch (sharpErr) {
-                    await sock.sendMessage(msg.key.remoteJid, { text: `❌ Görsel webp'ye dönüştürülemedi. Hata: ${sharpErr?.message || sharpErr}` }, { quoted: msg });
+                    await msg.reply(`❌ Görsel webp'ye dönüştürülemedi. Hata: ${sharpErr?.message || sharpErr}`);
                     return;
                 }
-                await sock.sendMessage(msg.key.remoteJid, { sticker: webpBuffer, mimetype: 'image/webp' }, { quoted: msg });
+                
+                const stickerMedia = new MessageMedia('image/webp', webpBuffer.toString('base64'));
+                await client.sendMessage(msg.from, stickerMedia, { sendMediaAsSticker: true });
             } catch (err) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Çıkartma oluşturulamadı. Hata: ${err?.message || err}` }, { quoted: msg });
+                await msg.reply(`❌ Çıkartma oluşturulamadı. Hata: ${err?.message || err}`);
             }
             return;
-    } else if (cmdIs('/blacklist','/karaliste')) {
+        } else if (cmdIs('/blacklist','/karaliste')) {
             // Sadece bot sahibi kullanabilsin (örnek: kendi numaranız)
-            const senderId = msg.key.participant || msg.key.remoteJid;
+            const senderId = msg.author || msg.from;
             if (!isAdmin(senderId)) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot yöneticileri kullanabilir.' }, { quoted: msg });
+                await msg.reply('❌ Bu komutu sadece bot yöneticileri kullanabilir.');
                 return;
             }
             const parts = messageText.trim().split(/\s+/);
             if (parts.length < 2) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Karalisteye almak için sohbet JID girin. Örnek: /blacklist 120363401359968775@g.us' }, { quoted: msg });
+                await msg.reply('❌ Karalisteye almak için sohbet JID girin. Örnek: /blacklist 120363401359968775@g.us');
                 return;
             }
             const jidInput = parts[1];
@@ -656,42 +529,42 @@ async function startBot() {
             if (!blacklist.includes(normalizedJ)) {
                 blacklist.push(normalizedJ);
                 saveBlacklist();
-                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${normalizedJ} karalisteye alındı.` }, { quoted: msg });
+                await msg.reply(`✅ ${normalizedJ} karalisteye alındı.`);
             } else {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ ${normalizedJ} zaten karalistede.` }, { quoted: msg });
+                await msg.reply(`❌ ${normalizedJ} zaten karalistede.`);
             }
             return;
-    } else if (cmdIs('/maksimumdosyasınırı')) {
+        } else if (cmdIs('/maksimumdosyasınırı')) {
             // Sadece bot sahibi kullanabilsin
-            const senderId3 = msg.key.participant || msg.key.remoteJid;
+            const senderId3 = msg.author || msg.from;
             if (!isAdmin(senderId3)) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot yöneticileri kullanabilir.' }, { quoted: msg });
+                await msg.reply('❌ Bu komutu sadece bot yöneticileri kullanabilir.');
                 return;
             }
             const parts = messageText.trim().split(/\s+/);
             if (parts.length < 2) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Lütfen megabayt cinsinden bir sayı girin. Örnek: /maksimumdosyasınırı 50` }, { quoted: msg });
+                await msg.reply(`❌ Lütfen megabayt cinsinden bir sayı girin. Örnek: /maksimumdosyasınırı 50`);
                 return;
             }
             const parsed = Number(parts[1]);
             if (Number.isNaN(parsed) || parsed <= 0) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Geçerli bir pozitif sayı girin. Örnek: /maksimumdosyasınırı 50` }, { quoted: msg });
+                await msg.reply(`❌ Geçerli bir pozitif sayı girin. Örnek: /maksimumdosyasınırı 50`);
                 return;
             }
             settings.maxFileSizeMB = Math.floor(parsed);
             saveSettings();
-            await sock.sendMessage(msg.key.remoteJid, { text: `✅ Maksimum dosya boyutu ${settings.maxFileSizeMB}MB olarak ayarlandı.` }, { quoted: msg });
+            await msg.reply(`✅ Maksimum dosya boyutu ${settings.maxFileSizeMB}MB olarak ayarlandı.`);
             return;
-    } else if (cmdIs('/unblacklist','/karalistencikar','/karalistedencikar','/karalisteçikar')) {
+        } else if (cmdIs('/unblacklist','/karalistencikar','/karalistedencikar','/karalisteçikar')) {
             // Sadece bot sahibi kullanabilsin
-            const senderId2 = msg.key.participant || msg.key.remoteJid;
+            const senderId2 = msg.author || msg.from;
             if (!isAdmin(senderId2)) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece bot yöneticileri kullanabilir.' }, { quoted: msg });
+                await msg.reply('❌ Bu komutu sadece bot yöneticileri kullanabilir.');
                 return;
             }
             const parts = messageText.trim().split(/\s+/);
             if (parts.length < 2) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Karalisteden çıkarmak için sohbet JID girin. Örnek: /unblacklist 120363401359968775@g.us' }, { quoted: msg });
+                await msg.reply('❌ Karalisteden çıkarmak için sohbet JID girin. Örnek: /unblacklist 120363401359968775@g.us');
                 return;
             }
             const jidInput = parts[1];
@@ -699,111 +572,113 @@ async function startBot() {
             if (blacklist.includes(normalizedJ2)) {
                 blacklist = blacklist.filter(j => j !== normalizedJ2);
                 saveBlacklist();
-                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${normalizedJ2} karalisteden çıkarıldı.` }, { quoted: msg });
+                await msg.reply(`✅ ${normalizedJ2} karalisteden çıkarıldı.`);
             } else {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ ${normalizedJ2} karalistede değil.` }, { quoted: msg });
+                await msg.reply(`❌ ${normalizedJ2} karalistede değil.`);
             }
             return;
         } else if (cmdIs('/kick','/at')) {
             // /kick komutu: Sadece grup sohbetlerinde çalışır
-        } else if (messageText.trim().toLowerCase().startsWith('/lockall')) {
-            // /lockall komutu: Sadece grup sohbetlerinde çalışır
-            if (!msg.key.remoteJid.endsWith('@g.us')) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komut sadece grup sohbetlerinde kullanılabilir.' }, { quoted: msg });
+            const chat = await msg.getChat();
+            if (!chat.isGroup) {
+                await msg.reply('❌ Bu komut sadece grup sohbetlerinde kullanılabilir.');
                 return;
             }
-            // Sadece adminler kullanabilsin
-            const groupMetadata = await sock.groupMetadata(msg.key.remoteJid);
-            const senderId = (msg.key.participant || msg.key.remoteJid.split('@')[0] + '@s.whatsapp.net');
-            // Tüm olası sender JID formatlarını kontrol et
-            const senderIds = [
-                senderId,
-                senderId.replace('@s.whatsapp.net', '@lid'),
-                senderId.replace('@s.whatsapp.net', '@c.us')
-            ];
-            let isGroupAdmin = false;
-            for (const id of senderIds) {
-                const senderParticipant = groupMetadata.participants.find(p => p.id === id);
-                if (senderParticipant && (senderParticipant.admin === true || senderParticipant.admin === 'admin' || senderParticipant.admin === 'superadmin' || senderParticipant.isAdmin === true || senderParticipant.isSuperAdmin === true)) {
-                    isGroupAdmin = true;
-                    break;
-                }
-            }
-            // izin: grup yöneticisi veya bot yöneticisi
-            if (!isGroupAdmin && !isAdmin(senderId)) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece grup yöneticileri veya bot yöneticileri kullanabilir.' }, { quoted: msg });
-                return;
-            }
-            // Grubu sadece yöneticilere aç
-            try {
-                await sock.groupSettingUpdate(msg.key.remoteJid, 'announcement');
-                await sock.sendMessage(msg.key.remoteJid, { text: '🔒 Grup sadece yöneticilere yazılabilir olarak kilitlendi.' }, { quoted: msg });
-            } catch (err) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Grup kilitlenemedi. Hata: ${err?.message || err}` }, { quoted: msg });
-            }
-            return;
-        } else if (cmdIs('/unlock','/kilitac','/kilitaç')) {
-            // /unlock komutu: Sadece grup sohbetlerinde çalışır
-            if (!msg.key.remoteJid.endsWith('@g.us')) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komut sadece grup sohbetlerinde kullanılabilir.' }, { quoted: msg });
-                return;
-            }
-            // Sadece adminler kullanabilsin
-            const groupMetadata = await sock.groupMetadata(msg.key.remoteJid);
-            const senderId = (msg.key.participant || msg.key.remoteJid.split('@')[0] + '@s.whatsapp.net');
-            const senderIds = [
-                senderId,
-                senderId.replace('@s.whatsapp.net', '@lid'),
-                senderId.replace('@s.whatsapp.net', '@c.us')
-            ];
-            let isGroupAdmin2 = false;
-            for (const id of senderIds) {
-                const senderParticipant = groupMetadata.participants.find(p => p.id === id);
-                if (senderParticipant && (senderParticipant.admin === true || senderParticipant.admin === 'admin' || senderParticipant.admin === 'superadmin' || senderParticipant.isAdmin === true || senderParticipant.isSuperAdmin === true)) {
-                    isGroupAdmin2 = true;
-                    break;
-                }
-            }
-            if (!isGroupAdmin2 && !isAdmin(senderId)) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komutu sadece grup yöneticileri veya bot yöneticileri kullanabilir.' }, { quoted: msg });
-                            await sock.sendMessage(msg.key.remoteJid, { sticker: buffer, mimetype: 'image/webp' }, { quoted: msg });
-            }
-            // Grubu tekrar herkese aç
-            try {
-                await sock.groupSettingUpdate(msg.key.remoteJid, 'not_announcement');
-                await sock.sendMessage(msg.key.remoteJid, { text: '🔓 Grup tekrar herkese yazılabilir olarak açıldı.' }, { quoted: msg });
-            } catch (err) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Grup açılamadı. Hata: ${err?.message || err}` }, { quoted: msg });
-            }
-            return;
-            if (!msg.key.remoteJid.endsWith('@g.us')) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Bu komut sadece grup sohbetlerinde kullanılabilir.' }, { quoted: msg });
-                return;
-            }
+            
             // Komut: /kick 905xxxxxxxxx
             const parts = messageText.trim().split(/\s+/);
             if (parts.length < 2) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Lütfen atmak istediğiniz kişinin numarasını yazın. Örnek: /kick 905xxxxxxxxx' }, { quoted: msg });
+                await msg.reply('❌ Lütfen atmak istediğiniz kişinin numarasını yazın. Örnek: /kick 905xxxxxxxxx');
                 return;
             }
             let phone = parts[1].replace(/[^0-9]/g, '');
             if (phone.length < 10) {
-                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Geçerli bir numara girin. Örnek: /kick 905xxxxxxxxx' }, { quoted: msg });
+                await msg.reply('❌ Geçerli bir numara girin. Örnek: /kick 905xxxxxxxxx');
                 return;
             }
             if (!phone.startsWith('90')) phone = '90' + phone; // Türkiye için
-            const jid = phone + '@s.whatsapp.net';
+            const jid = phone + '@c.us';
+            
+            // Check if sender is group admin or bot admin
+            const senderId = msg.author || msg.from;
+            const participants = chat.participants;
+            const senderParticipant = participants.find(p => p.id._serialized === senderId);
+            const isGroupAdmin = senderParticipant && senderParticipant.isAdmin;
+            
+            if (!isGroupAdmin && !isAdmin(senderId)) {
+                await msg.reply('❌ Bu komutu sadece grup yöneticileri veya bot yöneticileri kullanabilir.');
+                return;
+            }
+            
             // Kullanıcıyı gruptan at
             try {
-                await sock.groupParticipantsUpdate(msg.key.remoteJid, [jid], 'remove');
-                await sock.sendMessage(msg.key.remoteJid, { text: `✅ ${phone} numaralı kullanıcı gruptan atıldı.` }, { quoted: msg });
+                await chat.removeParticipants([jid]);
+                await msg.reply(`✅ ${phone} numaralı kullanıcı gruptan atıldı.`);
             } catch (err) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Kullanıcı atılamadı. Hata: ${err?.message || err}` }, { quoted: msg });
+                await msg.reply(`❌ Kullanıcı atılamadı. Hata: ${err?.message || err}`);
+            }
+            return;
+        } else if (cmdIs('/lockall')) {
+            // /lockall komutu: Sadece grup sohbetlerinde çalışır
+            const chat = await msg.getChat();
+            if (!chat.isGroup) {
+                await msg.reply('❌ Bu komut sadece grup sohbetlerinde kullanılabilir.');
+                return;
+            }
+            
+            // Sadece adminler kullanabilsin
+            const senderId = msg.author || msg.from;
+            const participants = chat.participants;
+            const senderParticipant = participants.find(p => p.id._serialized === senderId);
+            const isGroupAdmin = senderParticipant && senderParticipant.isAdmin;
+            
+            // izin: grup yöneticisi veya bot yöneticisi
+            if (!isGroupAdmin && !isAdmin(senderId)) {
+                await msg.reply('❌ Bu komutu sadece grup yöneticileri veya bot yöneticileri kullanabilir.');
+                return;
+            }
+            
+            // Grubu sadece yöneticilere aç
+            try {
+                await chat.setMessagesAdminsOnly(true);
+                await msg.reply('🔒 Grup sadece yöneticilere yazılabilir olarak kilitlendi.');
+            } catch (err) {
+                await msg.reply(`❌ Grup kilitlenemedi. Hata: ${err?.message || err}`);
+            }
+            return;
+        } else if (cmdIs('/unlock','/kilitac','/kilitaç')) {
+            // /unlock komutu: Sadece grup sohbetlerinde çalışır
+            const chat = await msg.getChat();
+            if (!chat.isGroup) {
+                await msg.reply('❌ Bu komut sadece grup sohbetlerinde kullanılabilir.');
+                return;
+            }
+            
+            // Sadece adminler kullanabilsin
+            const senderId = msg.author || msg.from;
+            const participants = chat.participants;
+            const senderParticipant = participants.find(p => p.id._serialized === senderId);
+            const isGroupAdmin2 = senderParticipant && senderParticipant.isAdmin;
+            
+            if (!isGroupAdmin2 && !isAdmin(senderId)) {
+                await msg.reply('❌ Bu komutu sadece grup yöneticileri veya bot yöneticileri kullanabilir.');
+                return;
+            }
+            
+            // Grubu tekrar herkese aç
+            try {
+                await chat.setMessagesAdminsOnly(false);
+                await msg.reply('🔓 Grup tekrar herkese yazılabilir olarak açıldı.');
+            } catch (err) {
+                await msg.reply(`❌ Grup açılamadı. Hata: ${err?.message || err}`);
             }
             return;
         }
     });
-    return sock;
+
+    await client.initialize();
+    
+    return client;
 }
 
 // Start the bot
